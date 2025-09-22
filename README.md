@@ -33,3 +33,5 @@ pip install -U faster-whisper sounddevice numpy python-dotenv google-generativea
 
 # Create a .env file in the project root with the following:
 GEMINI_API_KEY=api_key
+
+python voice_to_nutrients.py
