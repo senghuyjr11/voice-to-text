@@ -1,27 +1,18 @@
-# voice_to_text.py
-# Real-time headset-mic dictation → Agent-only food extraction + nutrients (no local CSV) → Diabetes metrics → JSON log
-# - Locks to a headset/earphone mic (auto-detect; env override supported)
-# - Transcribes in near-real-time with faster-whisper
-# - Uses Gemini to return a STRUCTURED JSON payload with foods, portions, and nutrients (per 100g and/or per portion)
-# - Computes net carbs and glycemic load (GL) from the agent’s data
-# - Saves full structured result to ./answers/answer_YYYYmmdd_HHMMSS.json
-# - Single-shot by default (one question → one answer → exit). Use --continuous for ongoing.
-# - Extras: VU meter clipping hint, robust JSON extraction, Gemini timeout/retries, optional --text mode
-
+import argparse
+import json
 import os
+import queue
 import sys
 import time
-import json
-import queue
-import argparse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from datetime import datetime
+from typing import Optional
+
 import numpy as np
 import sounddevice as sd
-from collections import deque
-from datetime import datetime
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
-from typing import Optional
 
 # --------------------------
 # Environment & Config
@@ -32,7 +23,7 @@ SAMPLE_RATE = int(os.getenv("SAMPLE_RATE", "16000"))
 CHANNELS = 1
 
 # Audio device selection
-INPUT_DEVICE_INDEX_ENV = os.getenv("INPUT_DEVICE_INDEX")  # optional manual override
+INPUT_DEVICE_INDEX_ENV = os.getenv("INPUT_DEVICE_INDEX")
 PREFERRED_DEVICE_KEYWORDS = [
     "headset", "headphone", "earphone", "airpods", "buds", "in-ear",
     "logitech", "hyperx", "steelseries", "razer", "corsair", "sony",
