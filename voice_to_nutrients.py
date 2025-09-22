@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import sys
 import time
 from collections import deque
@@ -13,7 +14,6 @@ import numpy as np
 import sounddevice as sd
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
-import re
 
 # ==========================
 # Environment & Config
@@ -41,7 +41,7 @@ WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "1"))
 
 # Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL")
 GEMINI_TIMEOUT_SECS = float(os.getenv("GEMINI_TIMEOUT_SECS", "12.0"))
 GEMINI_RETRIES = int(os.getenv("GEMINI_RETRIES", "2"))
 GEMINI_BACKOFF_SECS = float(os.getenv("GEMINI_BACKOFF_SECS", "0.4"))
@@ -67,7 +67,7 @@ ROUND_NUTRIENT_DECIMALS = int(os.getenv("ROUND_NUTRIENT_DECIMALS", "1"))
 ROUND_CALORIES_DECIMALS = int(os.getenv("ROUND_CALORIES_DECIMALS", "0"))
 
 # GI Source (shown even if agent omits it)
-GI_SOURCE_DEFAULT = os.getenv("GI_SOURCE_DEFAULT", "https://glycemicindex.com/")
+GI_SOURCE_DEFAULT = os.getenv("GI_SOURCE_DEFAULT")
 
 # ==========================
 # Audio device helpers
@@ -312,49 +312,173 @@ def _round(v, ndigits):
     except Exception:
         return v
 
-def format_console_answer(question: str, foods: list[dict]) -> str:
+def compute_item_metrics_dynamic(food: dict, gi_percent_base: Optional[float]) -> Optional[dict]:
+    """
+    Compute per-item metrics. GL uses gi_percent_base from agent config.
+    If gi_percent_base is None, GL will be omitted (None).
+    """
+    name = food.get("name") or "unknown"
+    per100 = food.get("per_100g") or {}
+    pp = food.get("per_portion") or {}
+    grams = None
+    if isinstance(pp, dict):
+        grams = safe_num(pp.get("grams"))
+
+    # Prefer per_portion nutrients when present; else scale per_100g by grams
+    if isinstance(pp, dict) and pp.get("carbs_g") is not None:
+        grams_used = _round(safe_num(pp.get("grams")), int(os.getenv("ROUND_GRAMS_DECIMALS", "1")))
+        carbs = safe_num(pp.get("carbs_g"), 0.0)
+        fiber = safe_num(pp.get("fiber_g"), 0.0)
+        sugars = safe_num(pp.get("sugars_g"))
+        protein = safe_num(pp.get("protein_g"))
+        fat = safe_num(pp.get("fat_g"))
+        calories = safe_num(pp.get("calories"))
+    elif grams is not None and per100.get("carbs_g") is not None:
+        # scale from per_100g; denominator is env-configurable (still not a medical threshold)
+        denom = float(os.getenv("PER100_DENOM", "100"))
+        f = grams / denom
+        grams_used = _round(grams, int(os.getenv("ROUND_GRAMS_DECIMALS", "1")))
+        carbs = safe_num(per100.get("carbs_g"), 0.0) * f
+        fiber = (safe_num(per100.get("fiber_g"), 0.0) * f) if per100.get("fiber_g") is not None else 0.0
+        sugars = (safe_num(per100.get("sugars_g"), 0.0) * f) if per100.get("sugars_g") is not None else None
+        protein = (safe_num(per100.get("protein_g"), 0.0) * f) if per100.get("protein_g") is not None else None
+        fat = (safe_num(per100.get("fat_g"), 0.0) * f) if per100.get("fat_g") is not None else None
+        calories = (safe_num(per100.get("calories"), 0.0) * f) if per100.get("calories") is not None else None
+    else:
+        return None
+
+    net = max((carbs or 0.0) - (fiber or 0.0), 0.0)
+
+    gi_block = food.get("gi") or {}
+    gi_value = safe_num(gi_block.get("value"))
+    gl = None
+    if gi_value is not None and gi_percent_base:
+        try:
+            gl = gi_value * net / gi_percent_base
+        except Exception:
+            gl = None
+
+    return {
+        "label": name,
+        "grams": _round(grams_used, int(os.getenv("ROUND_GRAMS_DECIMALS", "1"))),
+        "carbs_g": _round(carbs, int(os.getenv("ROUND_NUTRIENT_DECIMALS", "1"))),
+        "fiber_g": _round(fiber or 0.0, int(os.getenv("ROUND_NUTRIENT_DECIMALS", "1"))),
+        "sugars_g": _round(sugars, int(os.getenv("ROUND_NUTRIENT_DECIMALS", "1"))) if sugars is not None else None,
+        "protein_g": _round(protein, int(os.getenv("ROUND_NUTRIENT_DECIMALS", "1"))) if protein is not None else None,
+        "fat_g": _round(fat, int(os.getenv("ROUND_NUTRIENT_DECIMALS", "1"))) if fat is not None else None,
+        "calories": _round(calories, int(os.getenv("ROUND_CALORIES_DECIMALS", "0"))) if calories is not None else None,
+        "net_carbs_g": _round(net, int(os.getenv("ROUND_NUTRIENT_DECIMALS", "1"))),
+        "gi": gi_value,
+        "gi_confidence": gi_block.get("confidence"),
+        "gl": _round(gl, int(os.getenv("ROUND_NUTRIENT_DECIMALS", "1"))) if gl is not None else None,
+        "source": gi_block.get("source"),
+    }
+
+def gl_verdict_from_config(meal_gl: Optional[float], cfg: Optional[dict]) -> Optional[str]:
+    """
+    Categorize GL using bins/messages from agent config.
+    Returns a string verdict or None if config/gl missing.
+    """
+    if meal_gl is None or not cfg:
+        return None
+    bins = cfg.get("gl_bins")
+    msgs = cfg.get("gl_messages")
+    if not (isinstance(bins, list) and len(bins) == 3 and isinstance(msgs, list) and len(msgs) == 4):
+        return None
+
+    t0, t1, t2 = bins
+    t0p1, t1p1, t2p1 = t0 + 1, t1 + 1, t2 + 1
+
+    def fmt(msg):
+        return msg.format(t0=t0, t1=t1, t2=t2, t0p1=t0p1, t1p1=t1p1, t2p1=t2p1)
+
+    if meal_gl <= t0:
+        return fmt(msgs[0])
+    if meal_gl <= t1:
+        return fmt(msgs[1])
+    if meal_gl <= t2:
+        return fmt(msgs[2])
+    return fmt(msgs[3])
+
+
+def evaluate_from_agent(agent_json: dict, agent) -> tuple[list[dict], dict, Optional[str]]:
+    """
+    Returns (items, totals, verdict). Verdict is None if config not provided by agent.
+    """
+    cfg = fetch_diabetes_config(agent)  # may be None (we won't invent numbers)
+
+    gi_percent_base = cfg.get("gi_percent_base") if cfg else None
+
+    foods = agent_json.get("foods") or []
+    items = []
+    for f in foods:
+        m = compute_item_metrics_dynamic(f, gi_percent_base)
+        if m:
+            items.append(m)
+
+    if not items:
+        return [], {"total_net_carbs_g": 0.0, "meal_gl": None}, None
+
+    total_net = _round(sum(i["net_carbs_g"] for i in items), int(os.getenv("ROUND_NUTRIENT_DECIMALS", "1")))
+    gl_vals = [i["gl"] for i in items if i["gl"] is not None]
+    meal_gl = _round(sum(gl_vals), int(os.getenv("ROUND_NUTRIENT_DECIMALS", "1"))) if gl_vals else None
+
+    verdict = gl_verdict_from_config(meal_gl, cfg)
+    return items, {"total_net_carbs_g": total_net, "meal_gl": meal_gl}, verdict
+
+def format_console_answer(
+    question: str,
+    items: list[dict],
+    totals: dict,
+    verdict: str | None
+) -> str:
+    """
+    Render a concise console answer.
+    - Items are already computed (include net_carbs_g, gl, gi, etc.).
+    - verdict may be None if the agent didn't provide GL bins/messages.
+    """
     lines: list[str] = []
     lines.append(f"Processing: {question}")
     lines.append("")
-    title = foods[0]["name"] if foods else "Food"
-    lines.append(f"**Nutrition (Agent Extracted) — {title}**")
+
+    title_name = (items[0].get("label") if items else "Meal") or "Meal"
+    lines.append(f"**Nutrition Summary — {title_name}**")
     lines.append("")
-    for f in foods[:MAX_ITEMS_SHOWN]:
-        name = f.get("name", "Food")
+
+    # Per-item sections
+    for it in items[:int(os.getenv("MAX_ITEMS_SHOWN", "3"))]:
+        name = it.get("label", "Food")
         lines.append(f"**{name}**")
-        # Prefer per_portion if present, else per_100g
-        pp = f.get("per_portion") or {}
-        ppg = safe_num(pp.get("grams")) if isinstance(pp, dict) else None
-        p100 = f.get("per_100g") or {}
+        lines.append(f"*   Portion: {_fmt_value(it.get('grams'),' g')}")
+        lines.append(f"*   Calories: {_fmt_value(it.get('calories'),' kcal')}")
+        lines.append(f"*   Carbs: {_fmt_value(it.get('carbs_g'),' g')} (fiber: {_fmt_value(it.get('fiber_g'),' g')}, sugars: {_fmt_value(it.get('sugars_g'),' g')})")
+        lines.append(f"*   Protein: {_fmt_value(it.get('protein_g'),' g')}")
+        lines.append(f"*   Fat: {_fmt_value(it.get('fat_g'),' g')}")
 
-        if isinstance(pp, dict) and ppg:
-            lines.append(f"*   Portion: {_fmt_value(_round(ppg, ROUND_GRAMS_DECIMALS), ' g')}")
-            lines.append(f"*   Calories: {_fmt_value(_round(safe_num(pp.get('calories')), ROUND_CALORIES_DECIMALS), ' kcal')}")
-            lines.append(f"*   Carbs: {_fmt_value(_round(safe_num(pp.get('carbs_g')), ROUND_NUTRIENT_DECIMALS), ' g')}")
-            lines.append(f"*   Fiber: {_fmt_value(_round(safe_num(pp.get('fiber_g')), ROUND_NUTRIENT_DECIMALS), ' g')}")
-            lines.append(f"*   Sugars: {_fmt_value(_round(safe_num(pp.get('sugars_g')), ROUND_NUTRIENT_DECIMALS), ' g')}")
-            lines.append(f"*   Protein: {_fmt_value(_round(safe_num(pp.get('protein_g')), ROUND_NUTRIENT_DECIMALS), ' g')}")
-            lines.append(f"*   Fat: {_fmt_value(_round(safe_num(pp.get('fat_g')), ROUND_NUTRIENT_DECIMALS), ' g')}")
-        elif isinstance(p100, dict) and p100:
-            lines.append(f"*   Basis: per 100 g")
-            lines.append(f"*   Calories: {_fmt_value(_round(safe_num(p100.get('calories')), ROUND_CALORIES_DECIMALS), ' kcal')}")
-            lines.append(f"*   Carbs: {_fmt_value(_round(safe_num(p100.get('carbs_g')), ROUND_NUTRIENT_DECIMALS), ' g')}")
-            lines.append(f"*   Fiber: {_fmt_value(_round(safe_num(p100.get('fiber_g')), ROUND_NUTRIENT_DECIMALS), ' g')}")
-            lines.append(f"*   Sugars: {_fmt_value(_round(safe_num(p100.get('sugars_g')), ROUND_NUTRIENT_DECIMALS), ' g')}")
-            lines.append(f"*   Protein: {_fmt_value(_round(safe_num(p100.get('protein_g')), ROUND_NUTRIENT_DECIMALS), ' g')}")
-            lines.append(f"*   Fat: {_fmt_value(_round(safe_num(p100.get('fat_g')), ROUND_NUTRIENT_DECIMALS), ' g')}")
+        # Diabetes-related numbers are computed dynamically from agent config (no static thresholds in code)
+        lines.append(f"*   Net carbs: {_fmt_value(it.get('net_carbs_g'),' g')}")
 
-        gi = f.get("gi") or {}
-        gi_val = safe_num(gi.get("value"))
-        gi_conf = gi.get("confidence")
+        gi_val = it.get("gi")
+        gi_conf = it.get("gi_confidence")
         if gi_val is not None:
             conf = f" ({gi_conf})" if gi_conf else ""
-            lines.append(f"*   GI: {gi_val}{conf}")
-        # always show a GI source link for provenance
-        src = gi.get("source") or GI_SOURCE_DEFAULT
+            lines.append(f"*   GI: {_fmt_value(gi_val)}{conf}")
+
+        if it.get("gl") is not None:
+            lines.append(f"*   GL (this portion): {_fmt_value(it.get('gl'))}")
+
+        src = it.get("source") or os.getenv("GI_SOURCE_DEFAULT")
         lines.append(f"*   GI source: {src}")
         lines.append("")
+
+    # Verdict & totals (verdict may be None if agent didn't provide bins/messages)
+    tnet = totals.get("total_net_carbs_g")
+    tgl = totals.get("meal_gl")
+    gl_part = f", Meal GL ≈ {tgl}" if tgl is not None else ""
+    prefix = f"{verdict} " if verdict else ""
+    lines.append(f"**In short:** {prefix}Net carbs (meal): {_fmt_value(tnet,' g')}{gl_part}.")
     return "\n".join(lines)
+
 
 # ==========================
 # Audio processing
@@ -381,6 +505,7 @@ def save_answer_json(payload: dict) -> str:
 # ==========================
 def listen_and_answer(selected_device: int, agent: AgentNutrition, single_shot: bool = True):
     print("Ask your nutrition question... (Ctrl+C to exit)")
+
     with sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=CHANNELS,
@@ -398,7 +523,7 @@ def listen_and_answer(selected_device: int, agent: AgentNutrition, single_shot: 
 
             try:
                 while True:
-                    # drain audio -> rolling buffer
+                    # Drain audio queue into rolling buffer
                     while True:
                         try:
                             chunk = frame_queue.get_nowait()
@@ -407,6 +532,8 @@ def listen_and_answer(selected_device: int, agent: AgentNutrition, single_shot: 
                             break
 
                     now = time.time()
+
+                    # Periodically transcribe rolling buffer
                     if (now - last_transcribe_time) > TRANSCRIBE_INTERVAL and len(rolling_buffer) > SAMPLE_RATE * MIN_SEC_BEFORE_TRANSCRIBE:
                         last_transcribe_time = now
                         audio = np.array(rolling_buffer, dtype=np.float32)
@@ -423,31 +550,45 @@ def listen_and_answer(selected_device: int, agent: AgentNutrition, single_shot: 
                                 last_text_change_time = now
                                 print(f"\r{current_text}", end="", flush=True)
                         except Exception:
+                            # swallow transient ASR errors and keep listening
                             pass
 
+                    # If speech has settled for a bit, process it
                     if current_text and (now - last_text_change_time) > NO_NEW_TEXT_SECS:
                         break
+
                     time.sleep(float(os.getenv("SCHED_YIELD_SECS", "0.01")))
             except KeyboardInterrupt:
                 raise
 
+            # Nothing captured? Exit (one-shot) or continue (continuous)
             if not current_text:
                 if single_shot:
                     return
                 else:
                     continue
 
+            # ===== Process with agent =====
             print(f"\n\nProcessing: {current_text}")
             started_at = datetime.utcnow().isoformat() + "Z"
-            agent_json = agent.ask(current_text) or {"foods": [], "notes": "agent failed or returned empty"}
-            foods = agent_json.get("foods") or []
 
-            pretty = format_console_answer(current_text, foods)
+            agent_json = agent.ask(current_text) or {
+                "intent": "unknown",
+                "foods": [],
+                "notes": "agent failed or returned empty"
+            }
+
+            # Dynamic, agent-driven evaluation (no static thresholds in code)
+            items, totals, verdict = evaluate_from_agent(agent_json, agent)
+
+            # Render answer
+            pretty = format_console_answer(current_text, items, totals, verdict)
             print("\n" + pretty + "\n", flush=True)
 
+            # Persist payload
             payload = {
-                "ok": True if foods else False,
-                "error": None if foods else "No foods returned by agent.",
+                "ok": True if items else False,
+                "error": None if items else "No computable nutrients from agent.",
                 "engine": "faster-whisper",
                 "device": DEVICE,
                 "model_size": MODEL_SIZE,
@@ -456,6 +597,9 @@ def listen_and_answer(selected_device: int, agent: AgentNutrition, single_shot: 
                 "pre_gain_db": PRE_GAIN_DB,
                 "question": current_text,
                 "agent_raw": agent_json,
+                "items": items,
+                "totals": totals,
+                "verdict": verdict,
                 "answer_text": pretty,
                 "started_at": started_at,
                 "finished_at": datetime.utcnow().isoformat() + "Z",
@@ -463,9 +607,11 @@ def listen_and_answer(selected_device: int, agent: AgentNutrition, single_shot: 
             out_path = save_answer_json(payload)
             print(f"Saved JSON: {out_path}\n", flush=True)
 
+            # Reset for next utterance
             rolling_buffer.clear()
             if single_shot:
                 return
+
 
 # ==========================
 # Text mode
@@ -473,13 +619,25 @@ def listen_and_answer(selected_device: int, agent: AgentNutrition, single_shot: 
 def run_text_mode(text: str, agent: AgentNutrition):
     print(f"Text mode input: {text}")
     started_at = datetime.utcnow().isoformat() + "Z"
-    agent_json = agent.ask(text) or {"foods": [], "notes": "agent failed or returned empty"}
-    foods = agent_json.get("foods") or []
-    pretty = format_console_answer(text, foods)
+
+    # Ask Gemini agent
+    agent_json = agent.ask(text) or {
+        "intent": "unknown",
+        "foods": [],
+        "notes": "agent failed or returned empty"
+    }
+
+    # Compute nutrition & verdict (agent-driven, no static thresholds)
+    items, totals, verdict = evaluate_from_agent(agent_json, agent)
+
+    # Pretty console output
+    pretty = format_console_answer(text, items, totals, verdict)
     print("\n" + pretty + "\n", flush=True)
+
+    # Save JSON payload
     payload = {
-        "ok": True if foods else False,
-        "error": None if foods else "No foods returned by agent.",
+        "ok": True if items else False,
+        "error": None if items else "No computable nutrients from agent.",
         "engine": "faster-whisper (text-mode)",
         "device": DEVICE,
         "model_size": MODEL_SIZE,
@@ -488,12 +646,69 @@ def run_text_mode(text: str, agent: AgentNutrition):
         "pre_gain_db": PRE_GAIN_DB,
         "question": text,
         "agent_raw": agent_json,
+        "items": items,
+        "totals": totals,
+        "verdict": verdict,
         "answer_text": pretty,
         "started_at": started_at,
         "finished_at": datetime.utcnow().isoformat() + "Z",
     }
+
     out_path = save_answer_json(payload)
     print(f"Saved JSON: {out_path}\n", flush=True)
+
+
+# ===== Dynamic diabetes config (no static numbers) =====
+
+_DIABETES_CFG_CACHE = None
+
+def _as_safe_json(obj) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return "{}"
+
+def fetch_diabetes_config(agent) -> Optional[dict]:
+    """
+    Ask the agent for GL bins/messages and GI scaling base.
+    Caches result in-process. Returns dict or None.
+    Expected JSON shape:
+      {
+        "gl_bins": [t0, t1, t2],
+        "gl_messages": ["...", "...", "...", "..."],
+        "gi_percent_base": 100
+      }
+    """
+    global _DIABETES_CFG_CACHE
+    if _DIABETES_CFG_CACHE is not None:
+        return _DIABETES_CFG_CACHE
+
+    if not getattr(agent, "model", None):
+        return None
+
+    prompt = (os.getenv("DIABETES_CONFIG_PROMPT") or
+              "Return ONLY JSON with gl_bins, gl_messages, gi_percent_base.")
+
+    # Optionally provide context about locale/use:
+    payload = {"purpose": "glycemic-load categorization for meal outputs"}
+    full_prompt = f"{prompt}\n\nINPUT:\n{_as_safe_json(payload)}\n\nJSON:"
+
+    try:
+        data = agent._call_gemini_json(full_prompt)
+        # minimal validation
+        if not isinstance(data, dict):
+            return None
+        bins = data.get("gl_bins")
+        msgs = data.get("gl_messages")
+        base = data.get("gi_percent_base")
+        if (isinstance(bins, list) and len(bins) == 3 and
+            isinstance(msgs, list) and len(msgs) == 4 and
+            isinstance(base, (int, float)) and base > 0):
+            _DIABETES_CFG_CACHE = {"gl_bins": bins, "gl_messages": msgs, "gi_percent_base": float(base)}
+            return _DIABETES_CFG_CACHE
+    except Exception:
+        pass
+    return None
 
 # ==========================
 # Main
