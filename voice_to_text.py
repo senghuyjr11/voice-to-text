@@ -158,91 +158,30 @@ def load_whisper():
 
 model = load_whisper()
 
-
 # --------------------------
 # Agent: Nutrition Extract + Enrichment (Gemini only, no local DB)
 # --------------------------
 
 class AgentNutrition:
     """
-    Two-step agent:
-      1) Extract foods and portions from free text → JSON.
-      2) For any food missing nutrients, call the model again to fill:
-         - per_100g: carbs_g, fiber_g, sugars_g, protein_g, fat_g, calories
-         - per_portion: grams and the same nutrients if known
-         - gi: value if known (otherwise omit or give estimate with 'confidence')
-    Returns a single JSON object with foods fully enriched when possible.
+    Dynamic, agent-driven extractor/enricher.
+
+    Design:
+      - No static schemas or examples in code.
+      - The agent decides what fields to include.
+      - We only rely on a minimal contract for downstream math:
+          * foods: array of objects
+          * each food should try to include:
+                - name (string)
+                - per_100g.carbs_g (number)  <-- required for net carbs math
+                - optionally: per_100g.{fiber_g,sugars_g,protein_g,fat_g,calories}
+                - optionally: per_portion.grams (number)
+                - optionally: gi.value (number), gi.confidence (string), gi.source (string)
+        Any other fields the agent emits are allowed and simply ignored.
+      - Prompts are pulled from env so you can change them without code edits:
+          GEMINI_EXTRACTION_PROMPT
+          GEMINI_ENRICH_PROMPT
     """
-
-    SCHEMA_EXTRACT = {
-        "type": "object",
-        "properties": {
-            "intent": {"enum": ["can_i_eat", "nutrition_question", "unknown"]},
-            "foods": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "brand": {"type": "string"},
-                        "quantity": {
-                            "type": "object",
-                            "properties": {
-                                "amount": {"type": "number"},
-                                "unit": {"type": "string"},
-                            },
-                        },
-                        "size": {"type": "string"},
-                        "cooking_method": {"type": "string"},
-                        "modifiers": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["name"],
-                },
-            },
-        },
-        "required": ["foods"],
-    }
-
-    SCHEMA_ENRICH = {
-        "type": "object",
-        "properties": {
-            "name": {"type": "string"},
-            "portion_grams": {"type": "number"},
-            "per_100g": {
-                "type": "object",
-                "properties": {
-                    "calories": {"type": "number"},
-                    "carbs_g": {"type": "number"},
-                    "fiber_g": {"type": "number"},
-                    "sugars_g": {"type": "number"},
-                    "protein_g": {"type": "number"},
-                    "fat_g": {"type": "number"},
-                },
-                "required": ["carbs_g"],
-            },
-            "per_portion": {
-                "type": "object",
-                "properties": {
-                    "grams": {"type": "number"},
-                    "calories": {"type": "number"},
-                    "carbs_g": {"type": "number"},
-                    "fiber_g": {"type": "number"},
-                    "sugars_g": {"type": "number"},
-                    "protein_g": {"type": "number"},
-                    "fat_g": {"type": "number"},
-                },
-            },
-            "gi": {
-                "type": "object",
-                "properties": {
-                    "value": {"type": "number"},
-                    "source": {"type": "string"},
-                    "confidence": {"enum": ["low", "medium", "high"]},
-                },
-            },
-        },
-        "required": ["name", "per_100g"],
-    }
 
     def __init__(self, api_key: Optional[str], model_name: str):
         self.model = None
@@ -252,12 +191,39 @@ class AgentNutrition:
                 import google.generativeai as genai
                 genai.configure(api_key=api_key)
                 self.genai = genai
+                # Tip: you can also pass generation_config with response_mime_type="application/json"
+                # to reduce the need for manual JSON scraping.
                 self.model = genai.GenerativeModel(model_name)
             except Exception as e:
                 print(f"Gemini init warning: {e}")
                 self.model = None
 
         self._pool = ThreadPoolExecutor(max_workers=2)
+
+        # Load prompt templates from ENV (no static text baked in).
+        # Provide minimal safe defaults if unset.
+        self.prompt_extract = os.getenv(
+            "GEMINI_EXTRACTION_PROMPT",
+            (
+                "Goal: From the user's sentence, extract foods and any amounts/size/modifiers mentioned.\n"
+                "Return ONLY a single valid JSON object. Do not add prose.\n"
+                "The agent may choose any fields that are helpful, but include:\n"
+                '- "foods": [ { "name": string, ... } ] at minimum.\n'
+                "If possible, infer a broad 'intent' string (free-form).\n"
+            )
+        )
+
+        self.prompt_enrich = os.getenv(
+            "GEMINI_ENRICH_PROMPT",
+            (
+                "Goal: For the given food name and hints, return ONLY a single valid JSON object with nutrients.\n"
+                "Agent decides fields freely, but to enable calculations PLEASE include:\n"
+                '- per_100g: { carbs_g: number, optional: fiber_g, sugars_g, protein_g, fat_g, calories }\n'
+                "- portion_grams (number) OR per_portion.grams (number) if you can estimate a realistic portion size.\n"
+                "- If GI is known, include gi: { value: number, confidence?: string, source?: string }.\n"
+                "No prose. Only JSON."
+            )
+        )
 
     # ---- core public API
     def ask(self, question: str) -> Optional[dict]:
@@ -273,64 +239,56 @@ class AgentNutrition:
         base["foods"] = enriched_foods
         return base
 
-    # ---- step 1: extraction
+    # ---- step 1: extraction (agent-driven, no static schema/examples)
     def _extract_only(self, question: str) -> Optional[dict]:
         if not self.model:
             return None
 
-        system = (
-            "Extract foods and amounts from the user's sentence. "
-            "Return ONLY valid JSON matching this SCHEMA (no prose). "
-            "Be concise and do not invent foods not mentioned.\n\n"
-            f"SCHEMA:\n{json.dumps(self.SCHEMA_EXTRACT)}\n\n"
-            "EXAMPLES:\n"
-            "USER: Can I eat a bowl of white rice with fried chicken?\n"
-            'JSON: {"intent":"can_i_eat","foods":[{"name":"white rice","quantity":{"amount":1,"unit":"bowl"}},{"name":"fried chicken"}]}\n'
-            "USER: Is a medium banana okay before the gym?\n"
-            'JSON: {"intent":"can_i_eat","foods":[{"name":"banana","size":"medium"}]}\n'
+        # Keep it simple: the env-supplied prompt + user text, ask for JSON only.
+        prompt = (
+            f"{self.prompt_extract}\n"
+            "Guidelines:\n"
+            "- If nothing edible is found, return {\"foods\": []}.\n"
+            "- Use concise field names. Avoid null; prefer omission.\n"
+            "- You MAY include extra fields if helpful; they will be ignored if not used.\n\n"
+            f"USER:\n{question}\n\nJSON:"
         )
-        prompt = system + "\nUSER:\n" + question + "\nJSON:"
         return self._call_gemini_json(prompt)
 
-    # ---- step 2: enrichment for a single food
-    def _enrich_food(self, name: str, quantity: Optional[dict], size: Optional[str], cooking_method: Optional[str]) -> Optional[dict]:
+    # ---- step 2: enrichment for a single food (agent-driven)
+    def _enrich_food(self, name: str, quantity: Optional[dict], size: Optional[str], cooking_method: Optional[str]) -> \
+    Optional[dict]:
         if not self.model:
             return None
 
-        qty_str = ""
-        if quantity and (quantity.get("amount") or quantity.get("unit")):
-            qty_str = f' Given portion: amount={quantity.get("amount")}, unit="{quantity.get("unit")}".'
+        # quantity is already normalized dict from _ensure_enriched_food
+        hints = {}
+        if quantity and (quantity.get("amount") is not None or quantity.get("unit")):
+            hints["quantity"] = {"amount": quantity.get("amount"), "unit": quantity.get("unit")}
         if size:
-            qty_str += f' Size hint: "{size}".'
+            hints["size"] = size
         if cooking_method:
-            qty_str += f' Method: "{cooking_method}".'
+            hints["cooking_method"] = cooking_method
 
-        system = (
-            "For the named food, return ONLY JSON with per-100g nutrients (required), a realistic portion in grams, "
-            "optional per-portion nutrients, and GI if known. "
-            "Use grams for weights. If GI unknown, omit it. Do not include prose.\n\n"
-            f"SCHEMA:\n{json.dumps(self.SCHEMA_ENRICH)}\n\n"
-            "EXAMPLES:\n"
-            'FOOD: "fried chicken"\n'
-            'JSON: {"name":"fried chicken","portion_grams":150,'
-            '"per_100g":{"calories":246,"carbs_g":8.0,"fiber_g":0.3,"sugars_g":0.2,"protein_g":23.0,"fat_g":13.0},'
-            '"per_portion":{"grams":150,"calories":369,"carbs_g":12.0,"fiber_g":0.5,"sugars_g":0.3,"protein_g":34.5,"fat_g":19.5}}\n'
-            'FOOD: "white rice (cooked)"\n'
-            'JSON: {"name":"white rice (cooked)","portion_grams":150,'
-            '"per_100g":{"calories":130,"carbs_g":28.0,"fiber_g":0.4,"sugars_g":0.1,"protein_g":2.4,"fat_g":0.3},'
-            '"per_portion":{"grams":150,"calories":195,"carbs_g":42.0,"fiber_g":0.6,"sugars_g":0.2,"protein_g":3.6,"fat_g":0.5},'
-            '"gi":{"value":73,"confidence":"medium"}}\n'
+        prompt = (
+            f"{self.prompt_enrich}\n"
+            "Input format:\n"
+            "{ \"name\": string, \"hints\": { ...optional fields from extraction... } }\n\n"
+            "Input:\n"
+            f"{json.dumps({'name': name, 'hints': hints}, ensure_ascii=False)}\n\n"
+            "JSON:"
         )
-
-        user = f'FOOD: "{name}".{qty_str}\nJSON:'
-        prompt = system + "\n" + user
         return self._call_gemini_json(prompt)
 
     def _ensure_enriched_food(self, food: dict) -> Optional[dict]:
         name = (food.get("name") or "").strip()
         if not name:
             return None
-        quantity = food.get("quantity") or {}
+
+        # NEW: normalize quantity into {'amount', 'unit'}
+        raw_quantity = food.get("quantity")
+        quantity = normalize_quantity(raw_quantity)
+
         size = food.get("size")
         method = food.get("cooking_method")
 
@@ -341,7 +299,7 @@ class AgentNutrition:
         merged = {
             "name": enriched.get("name", name),
             "brand": food.get("brand"),
-            "quantity": quantity if quantity else None,
+            "quantity": quantity if (quantity.get("amount") is not None or quantity.get("unit")) else None,
             "size": size,
             "cooking_method": method,
             "portion_grams": enriched.get("portion_grams"),
@@ -349,6 +307,14 @@ class AgentNutrition:
             "per_portion": enriched.get("per_portion"),
             "gi": enriched.get("gi"),
         }
+
+        # Light normalization if model used another shape
+        if not merged.get("portion_grams"):
+            portion = enriched.get("portion") or {}
+            grams = portion.get("grams") if isinstance(portion, dict) else None
+            if grams is not None:
+                merged["portion_grams"] = grams
+
         return merged
 
     # ---- Gemini helpers (timeout + retries) ----
@@ -361,6 +327,7 @@ class AgentNutrition:
             try:
                 fut = self._pool.submit(self.model.generate_content, prompt)
                 out = fut.result(timeout=GEMINI_TIMEOUT_SECS)
+                # Prefer JSON-mode if available; otherwise, robust scrape.
                 txt = getattr(out, "text", "") or ""
                 data = self._extract_json(txt)
                 if data and isinstance(data, dict):
@@ -398,6 +365,53 @@ class AgentNutrition:
         return best
 
 
+import re
+
+def normalize_quantity(q) -> dict:
+    """
+    Normalize agent 'quantity' into a dict: {'amount': float|None, 'unit': str|None}.
+    Accepts dict, number, string, list; returns {} if unknown.
+    Examples:
+      1            -> {'amount': 1.0, 'unit': None}
+      "1 bowl"     -> {'amount': 1.0, 'unit': 'bowl'}
+      {"amount":2,"unit":"pcs"} -> {'amount': 2.0, 'unit': 'pcs'}
+      ["1","cup"]  -> {'amount': 1.0, 'unit': 'cup'}
+    """
+    if q is None:
+        return {}
+
+    if isinstance(q, dict):
+        return {
+            "amount": safe_num(q.get("amount")),
+            "unit": (q.get("unit") or "").strip() or None,
+        }
+
+    if isinstance(q, (int, float)):
+        return {"amount": float(q), "unit": None}
+
+    if isinstance(q, list):
+        # Try common patterns like ["1","cup"] or [1,"cup"] or ["1 cup"]
+        if len(q) == 1:
+            return normalize_quantity(q[0])
+        if len(q) >= 2:
+            amt = safe_num(q[0])
+            unit = " ".join(str(x) for x in q[1:]).strip() or None
+            return {"amount": amt, "unit": unit}
+        return {}
+
+    if isinstance(q, str):
+        s = q.strip()
+        # match "1", "1.5", "1 bowl", "2 pcs", "1 medium"
+        m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([^\d].*)?$", s)
+        if m:
+            amt = safe_num(m.group(1))
+            unit = (m.group(2) or "").strip() or None
+            return {"amount": amt, "unit": unit}
+        # If it's not a number-first string, treat the whole thing as a unit hint.
+        return {"amount": None, "unit": s or None}
+
+    return {}
+
 # --------------------------
 # Diabetes Metrics from Agent JSON
 # --------------------------
@@ -410,10 +424,13 @@ def safe_num(x, default=None):
 
 
 def pick_portion_grams(food: dict) -> Optional[float]:
-    per_portion = food.get("per_portion") or {}
-    g = safe_num(per_portion.get("grams"))
-    if g:
-        return g
+    per_portion = food.get("per_portion")
+    if isinstance(per_portion, (int, float)):
+        return float(per_portion)
+    if isinstance(per_portion, dict):
+        g = safe_num(per_portion.get("grams"))
+        if g:
+            return g
     g2 = safe_num(food.get("portion_grams"))
     if g2:
         return g2
@@ -434,18 +451,22 @@ def scale_from_per100(per100: dict, grams: float) -> dict:
 
 
 def choose_perportion(food: dict) -> Optional[dict]:
-    pp = food.get("per_portion") or {}
-    grams = safe_num(pp.get("grams"))
-    if grams:
-        return {
-            "grams": round(grams, 1),
-            "calories": safe_num(pp.get("calories")),
-            "carbs_g": safe_num(pp.get("carbs_g")),
-            "fiber_g": safe_num(pp.get("fiber_g")),
-            "sugars_g": safe_num(pp.get("sugars_g")),
-            "protein_g": safe_num(pp.get("protein_g")),
-            "fat_g": safe_num(pp.get("fat_g")),
-        }
+    pp = food.get("per_portion")
+    if isinstance(pp, (int, float)):
+        # Only grams known; other nutrients unknown
+        return {"grams": round(float(pp), 1)}
+    if isinstance(pp, dict):
+        grams = safe_num(pp.get("grams"))
+        if grams:
+            return {
+                "grams": round(grams, 1),
+                "calories": safe_num(pp.get("calories")),
+                "carbs_g": safe_num(pp.get("carbs_g")),
+                "fiber_g": safe_num(pp.get("fiber_g")),
+                "sugars_g": safe_num(pp.get("sugars_g")),
+                "protein_g": safe_num(pp.get("protein_g")),
+                "fat_g": safe_num(pp.get("fat_g")),
+            }
     return None
 
 
@@ -542,20 +563,6 @@ def _fmt_value(v, unit=""):
         return f"{v}{unit}"
 
 
-def _diabetes_guidance_lines(gi_known: bool) -> list[str]:
-    lines = []
-    if gi_known:
-        lines.append("*   **Diabetes:** GI/GL available. Use GL to judge: ≤10 low, 11–19 moderate, ≥20 high.")
-    else:
-        lines.append("*   **Diabetes:** GI not provided for at least one item. Use **net carbs** (carbs − fiber) and portion control.")
-    lines.append("*   **Portion tips:** Start with ~15–30 g net carbs per snack or ~45–60 g per meal (individualize per clinician).")
-    lines.append("*   **Pairing:** Combine carbs with protein or healthy fats (e.g., nuts, yogurt, eggs) to slow glucose rise.")
-    lines.append("*   **Ripeness/cooking:** Riper fruit & longer-cooked starches → higher GI; less ripe/al dente → lower GI.")
-    lines.append("*   **Monitor:** Check fingerstick/CGM at ~1–2 hours post-meal; adjust next time.")
-    lines.append("*   **Red flags:** If advised to limit potassium (kidney issues), watch high-K foods (e.g., bananas).")
-    return lines
-
-
 def format_console_answer(question: str, items: list[dict], totals: dict, verdict: str) -> str:
     lines: list[str] = []
     lines.append(f"Processing: {question}")
@@ -585,20 +592,6 @@ def format_console_answer(question: str, items: list[dict], totals: dict, verdic
             lines.append(f"*   GI source: {src}")
         lines.append("")
 
-    # Health implications with diabetes-specific guidance
-    lines.append("**Health Implications:**")
-    gi_known = any(it.get("gi") is not None for it in items)
-    lines.extend(_diabetes_guidance_lines(gi_known))
-    lines.append("*   **Diet:** Fit within your daily goals; fiber and protein support satiety.")
-    lines.append("*   **General:** Hydrate; consider activity (walk ~10–15 min post meal) to lower glucose.")
-    lines.append("")
-
-    # Practical recs
-    lines.append("**Practical Recommendations:**")
-    lines.append("*   **Moderation:** Keep portions sensible; adjust based on readings and activity.")
-    lines.append("*   **Swap-smart:** Prefer lower-GI options when possible (e.g., berries over juice; brown rice over sticky white rice).")
-    lines.append("*   **Timing:** If using insulin/meds, align timing with carb load per your care plan.")
-    lines.append("")
 
     # Verdict & totals
     tnet = totals.get("total_net_carbs_g")
